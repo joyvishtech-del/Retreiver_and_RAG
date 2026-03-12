@@ -1,4 +1,3 @@
-
 import os
 import json
 from typing import List, Dict, Any
@@ -9,211 +8,171 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
 
-# =========================================================
-# 1. SAMPLE DOCUMENTS
-# =========================================================
-policy_docs = [
-    Document(page_content="""
-Employees are entitled to 12 casual leave days per calendar year.
-Unused casual leave cannot be carried forward to the next year.
-    """),
-    Document(page_content="""
-Employees are entitled to 10 sick leave days per calendar year.
-A medical certificate is required if sick leave exceeds 2 consecutive days.
-    """),
-    Document(page_content="""
-Travel reimbursement for domestic business travel is capped at INR 5,000 per day,
-including lodging and meals, subject to manager approval.
-    """),
-    Document(page_content="""
-Work from home may be approved for up to 2 days per week depending on role requirements
-and manager approval.
-    """),
-    Document(page_content="""
-Maternity leave is available for 26 weeks in accordance with company policy and applicable law.
-    """),
+# -------------------------------------------------
+# 1. MEDICAL GUIDELINE DATA
+# -------------------------------------------------
+medical_docs = [
+    Document(page_content="Metformin is recommended as first-line pharmacologic therapy for Type 2 Diabetes unless contraindicated."),
+    Document(page_content="Lifestyle interventions such as diet modification, weight loss, and physical activity should begin at diagnosis."),
+    Document(page_content="Insulin therapy should be initiated when oral medications fail to control blood glucose."),
+    Document(page_content="Blood glucose monitoring is recommended for patients receiving insulin therapy."),
 ]
 
 
-# =========================================================
-# 2. BUILD VECTOR STORE
-# =========================================================
+# -------------------------------------------------
+# 2. VECTOR STORE
+# -------------------------------------------------
 embeddings = OpenAIEmbeddings()
-vectorstore = FAISS.from_documents(policy_docs, embeddings)
 
-retriever_initial = vectorstore.as_retriever(search_kwargs={"k": 2})
-retriever_corrected = vectorstore.as_retriever(search_kwargs={"k": 4})
+vectorstore = FAISS.from_documents(medical_docs, embeddings)
+
+retriever_initial = vectorstore.as_retriever(search_kwargs={"k":2})
+retriever_corrected = vectorstore.as_retriever(search_kwargs={"k":4})
 
 
-# =========================================================
-# 3. INITIALIZE LLM
-# =========================================================
+# -------------------------------------------------
+# 3. LLM
+# -------------------------------------------------
 llm = ChatOpenAI(
     model="gpt-4o-mini",
     temperature=0,
-    api_key=os.environ.get("OPENAI_API_KEY")
+    api_key=os.environ["OPENAI_API_KEY"]
 )
 
 
-# =========================================================
-# 4. HELPER: FORMAT DOCS AS CONTEXT
-# =========================================================
-def format_docs(docs: List[Document]) -> str:
-    return "\n\n".join([doc.page_content.strip() for doc in docs])
+# -------------------------------------------------
+# 4. FORMAT CONTEXT
+# -------------------------------------------------
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
 
-# =========================================================
+# -------------------------------------------------
 # 5. CONTEXT EVALUATION PROMPT
-# =========================================================
+# -------------------------------------------------
 evaluation_prompt = ChatPromptTemplate.from_template("""
-You are a corrective RAG evaluator.
+You are a corrective RAG evaluator for clinical guideline retrieval.
 
-Query:
-{user_query}
+Query: {user_query}
 
 Retrieved Context:
 {retrieved_context}
 
-Evaluate:
+Evaluate the context:
+
 1. Relevance score (0-1)
 2. Completeness score (0-1)
 3. Accuracy score (0-1)
 4. Specificity score (0-1)
 
-overall_quality: Excellent / Good / Fair / Poor
+Determine overall_quality: Excellent / Good / Fair / Poor
 
 Correction logic:
 If overall_quality is Fair or Poor:
 - action: RETRIEVE_AGAIN
 - refined_query: improved search query
-- reasoning: why correction is needed
+- reasoning: why retrieval must be corrected
 - confidence: Low
 
 If overall_quality is Excellent or Good:
 - action: PROCEED_WITH_ANSWER
+- reasoning: why context is sufficient
 - confidence: High or Medium
 
 Return JSON only.
 """)
 
 
-def evaluate_context(user_query: str, retrieved_context: str) -> Dict[str, Any]:
+def evaluate_context(query, context):
     chain = evaluation_prompt | llm
-    raw_response = chain.invoke({
-        "user_query": user_query,
-        "retrieved_context": retrieved_context
+    response = chain.invoke({
+        "user_query": query,
+        "retrieved_context": context
     }).content
 
-    try:
-        return json.loads(raw_response)
-    except:
-        start = raw_response.find("{")
-        end = raw_response.rfind("}") + 1
-        return json.loads(raw_response[start:end])
+    return json.loads(response)
 
 
-# =========================================================
+# -------------------------------------------------
 # 6. FINAL ANSWER PROMPT
-# =========================================================
+# -------------------------------------------------
 answer_prompt = ChatPromptTemplate.from_template("""
-You are an HR policy assistant.
+You are a clinical decision support assistant.
 
-Context Quality: {context_quality}
+Context Quality: {quality}
 Confidence Level: {confidence}
 
+Use ONLY the context below.
+
 Context:
-{retrieved_context}
+{context}
 
 Question:
-{user_query}
+{query}
 
 Response Format:
-Context Quality: [Excellent/Good/Fair/Poor]
-Confidence Level: [High/Medium/Low]
-Answer: <your grounded answer>
+
+Context Quality: {quality}
+Confidence Level: {confidence}
+Answer: <clinical answer>
 """)
 
 
-def generate_answer(user_query: str, retrieved_context: str, context_quality: str, confidence: str) -> str:
+def generate_answer(query, context, quality, confidence):
     chain = answer_prompt | llm
     response = chain.invoke({
-        "user_query": user_query,
-        "retrieved_context": retrieved_context,
-        "context_quality": context_quality,
+        "query": query,
+        "context": context,
+        "quality": quality,
         "confidence": confidence
     })
     return response.content
 
 
-# =========================================================
+# -------------------------------------------------
 # 7. CORRECTIVE RAG PIPELINE
-# =========================================================
-def corrective_rag(user_query: str) -> Dict[str, Any]:
-    print(f"\nUser Query: {user_query}")
+# -------------------------------------------------
+def corrective_rag(query):
 
-    initial_docs = retriever_initial.invoke(user_query)
-    initial_context = format_docs(initial_docs)
+    print("\nDoctor Query:", query)
 
-    print("\nInitial Retrieved Context:")
-    print(initial_context)
+    docs = retriever_initial.invoke(query)
+    context = format_docs(docs)
 
-    evaluation = evaluate_context(user_query, initial_context)
+    evaluation = evaluate_context(query, context)
 
-    print("\nEvaluation Result:")
-    print(json.dumps(evaluation, indent=2))
-
-    final_context = initial_context
-    final_docs = initial_docs
+    print("\nContext Evaluation:", evaluation)
 
     if evaluation["overall_quality"] in ["Fair", "Poor"]:
-        refined_query = evaluation.get("refined_query", user_query)
 
-        print("\nCorrection Triggered")
+        refined_query = evaluation["refined_query"]
+
+        print("\nCorrection triggered")
         print("Refined Query:", refined_query)
 
-        corrected_docs = retriever_corrected.invoke(refined_query)
-        final_docs = corrected_docs
-        final_context = format_docs(corrected_docs)
+        docs = retriever_corrected.invoke(refined_query)
+        context = format_docs(docs)
 
-        print("\nCorrected Retrieved Context:")
-        print(final_context)
+        evaluation = evaluate_context(query, context)
 
-        evaluation = evaluate_context(user_query, final_context)
-
-        print("\nRe-Evaluation Result:")
-        print(json.dumps(evaluation, indent=2))
-
-    final_answer = generate_answer(
-        user_query=user_query,
-        retrieved_context=final_context,
-        context_quality=evaluation["overall_quality"],
-        confidence=evaluation["confidence"]
+    answer = generate_answer(
+        query,
+        context,
+        evaluation["overall_quality"],
+        evaluation["confidence"]
     )
 
-    return {
-        "user_query": user_query,
-        "retrieved_documents": [doc.page_content for doc in final_docs],
-        "evaluation": evaluation,
-        "final_answer": final_answer
-    }
+    return answer
 
 
-# =========================================================
-# 8. RUN EXAMPLES
-# =========================================================
-if __name__ == "__main__":
-    queries = [
-        "How many casual leave days do employees get?",
-        "Can unused casual leave be carried forward?",
-        "What is the daily travel reimbursement limit for domestic business travel?",
-        "How many paternity leave days are available?"
-    ]
+# -------------------------------------------------
+# 8. RUN SAMPLE QUESTIONS
+# -------------------------------------------------
+queries = [
+    "What is the first line medication for Type 2 Diabetes?",
+    "When should insulin therapy be started?"
+]
 
-    for q in queries:
-        result = corrective_rag(q)
-
-        print("\n" + "=" * 70)
-        print("FINAL OUTPUT")
-        print("=" * 70)
-        print(result["final_answer"])
-        print("=" * 70)
+for q in queries:
+    result = corrective_rag(q)
+    print("\nFinal Answer:\n", result)
